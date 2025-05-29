@@ -1,0 +1,117 @@
+pipeline {
+    agent any
+
+    parameters {
+        string(name: 'COMMON_BRANCH', defaultValue: 'development', description: 'Branch for eze-common')
+        string(name: 'MWARE_BRANCH', defaultValue: 'development', description: 'Branch for eze-middleware')
+        booleanParam(name: 'SKIP_SONAR', defaultValue: false, description: 'Skip Sonar Analysis?')
+    }
+
+    environment {
+        MAVEN_REPO = '/var/lib/jenkins/maven-repositories-ezetap/Server-CI/.m2/repository'
+        JAVA_HOME = '/var/lib/jenkins/jdk-11.0.9/'
+        SONAR_URL = credentials('sonar-url')         // Replace with your Jenkins credential IDs
+        SONAR_USER = credentials('sonar-user')
+        SONAR_PASSWORD = credentials('sonar-password')
+    }
+
+    stages {
+        stage('Cleanup') {
+            steps {
+                script {
+                    // Stop running middleware processes and flush Redis, ignore errors
+                    sh '''
+                    pkill -9 -f middleware.jar || true
+                    redis-cli FLUSHALL
+                    '''
+                }
+            }
+        }
+
+        stage('Checkout Repos') {
+            parallel {
+                stage('Checkout eze-common') {
+                    steps {
+                        dir('common') {
+                            git branch: "${params.COMMON_BRANCH}", url: 'git@github.com:razorpay/eze-common.git'
+                        }
+                    }
+                }
+                stage('Checkout eze-middleware') {
+                    steps {
+                        dir('middleware') {
+                            git branch: "${params.MWARE_BRANCH}", url: 'git@github.com:razorpay/eze-middleware.git'
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Build eze-common') {
+            steps {
+                dir('common') {
+                    sh "mvn clean install -Dmaven.repo.local=${MAVEN_REPO}"
+                }
+            }
+        }
+
+        stage('Build eze-middleware') {
+            steps {
+                dir('middleware') {
+                    sh "sed -i -- 's/-Dpackaging=jar/-Dpackaging=jar -Dmaven.repo.local=${MAVEN_REPO}/' etc/3rdPartyLibs/setup3rdPartyLibs.sh"
+                    sh "etc/3rdPartyLibs/setup3rdPartyLibs.sh"
+                    sh "mvn clean install -Dmaven.repo.local=${MAVEN_REPO}"
+                }
+            }
+        }
+
+        stage('Sonar Analysis') {
+            when {
+                expression { return !params.SKIP_SONAR }
+            }
+            parallel {
+                stage('Sonar on eze-common') {
+                    steps {
+                        dir('common') {
+                            sh """
+                            export JAVA_HOME=${JAVA_HOME}
+                            mvn org.sonarsource.scanner.maven:sonar-maven-plugin:3.9.1.2184:sonar \
+                            -Dsonar.branch.name=${params.COMMON_BRANCH} \
+                            -Dsonar.host.url=${SONAR_URL} \
+                            -Dsonar.login=${SONAR_USER} \
+                            -Dsonar.password=${SONAR_PASSWORD} \
+                            -Dmaven.repo.local=${MAVEN_REPO}
+                            """
+                        }
+                    }
+                }
+                stage('Sonar on eze-middleware') {
+                    steps {
+                        dir('middleware') {
+                            sh """
+                            export JAVA_HOME=${JAVA_HOME}
+                            mvn org.sonarsource.scanner.maven:sonar-maven-plugin:3.9.1.2184:sonar \
+                            -Dsonar.branch.name=${params.MWARE_BRANCH} \
+                            -Dsonar.host.url=${SONAR_URL} \
+                            -Dsonar.login=${SONAR_USER} \
+                            -Dsonar.password=${SONAR_PASSWORD} \
+                            -Dmaven.repo.local=${MAVEN_REPO}
+                            """
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Prepare Reports') {
+            steps {
+                dir('common') {
+                    sh "mvn surefire-report:report -Daggregate=true -Dmaven.repo.local=${MAVEN_REPO}"
+                }
+                dir('middleware') {
+                    sh "mvn surefire-report:report -Daggregate=true -Dmaven.repo.local=${MAVEN_REPO}"
+                }
+            }
+        }
+    }
+}
